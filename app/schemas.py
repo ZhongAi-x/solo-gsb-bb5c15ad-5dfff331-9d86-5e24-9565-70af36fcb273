@@ -48,6 +48,22 @@ class TideForecastOut(BaseModel):
     tide_height: float
 
 
+class TideObservationPoint(BaseModel):
+    obs_time: datetime = Field(description="实测时刻（ISO 8601；无时区信息按 UTC 处理）")
+    tide_height: float = Field(description="实测潮高（米，相对海图基准面）")
+
+
+class TideObservationUpsert(BaseModel):
+    """批量写入实测潮高点：同港同一 UTC 时刻重复写入即覆盖旧值。"""
+
+    points: list[TideObservationPoint] = Field(min_length=1)
+
+
+class TideObservationOut(BaseModel):
+    obs_time: UtcDatetime
+    tide_height: float
+
+
 class WindowQuery(BaseModel):
     draft: float = Field(ge=0, description="船舶吃水（米）")
     safety_margin: float = Field(ge=0, description="安全富余（米）")

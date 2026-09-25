@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app.tides import (
+    calibrated_forecast_points,
     departure_windows,
     depth_deficit_audit,
     earliest_feasible_departure,
@@ -427,3 +428,119 @@ def test_merge_forecast_points_later_submission_overrides():
     # 纯内存合并：入参不被修改
     assert current == pts(1.0, 2.0, 3.0)
     assert len(submitted) == 4
+
+
+# ---------------------------------------------------------------------------
+# calibrated_forecast_points：实测潮位校准
+# ---------------------------------------------------------------------------
+
+
+def test_calibration_without_observations_equals_forecast():
+    forecast = pts(1.0, 2.0, 3.0)
+    assert calibrated_forecast_points(forecast, []) == forecast
+    # 纯内存计算：入参不被修改
+    assert forecast == pts(1.0, 2.0, 3.0)
+
+
+def test_calibration_fewer_than_two_forecast_points():
+    # 无插值区间时观测无法采用，原样返回
+    assert calibrated_forecast_points([], [(BASE, 1.0)]) == []
+    one = [(BASE, 1.0)]
+    assert calibrated_forecast_points(one, [(BASE, 2.0)]) == one
+
+
+def test_calibration_single_observation_residual_interpolation():
+    # 预报 0.0→2.0→0.0（00/01/02 时），01:00 实测 1.5 → 残差 -0.5
+    # 锚点残差：00:00=0、01:00=-0.5、02:00=0
+    forecast = pts(0.0, 2.0, 0.0)
+    calibrated = calibrated_forecast_points(
+        forecast, [(BASE + timedelta(hours=1), 1.5)]
+    )
+    assert calibrated == [
+        (BASE, 0.0),
+        (BASE + timedelta(hours=1), 1.5),
+        (BASE + timedelta(hours=2), 0.0),
+    ]
+
+
+def test_calibration_interior_observation_at_forecast_knot_time():
+    # 观测时刻与预报点重合（非边界）：校准值即实测值
+    forecast = pts(0.0, 2.0, 0.0)
+    calibrated = calibrated_forecast_points(
+        forecast, [(BASE + timedelta(hours=1), 2.3)]
+    )
+    by_time = dict(calibrated)
+    assert by_time[BASE + timedelta(hours=1)] == 2.3
+    # 边界仍为零残差：校准值 = 原预报值
+    assert by_time[BASE] == 0.0
+    assert by_time[BASE + timedelta(hours=2)] == 0.0
+
+
+def test_calibration_observation_between_knots_creates_vertex():
+    # 线性预报 0.0→2.0（00:00–02:00），01:00 实测 1.8（预报插值 1.0，残差 0.8）
+    forecast = [
+        (BASE, 0.0),
+        (BASE + timedelta(hours=2), 2.0),
+    ]
+    obs_t = BASE + timedelta(hours=1)
+    calibrated = calibrated_forecast_points(forecast, [(obs_t, 1.8)])
+    assert calibrated == [(BASE, 0.0), (obs_t, 1.8), (BASE + timedelta(hours=2), 2.0)]
+    # 折点间线性：01:30 处校准潮高 = 1.9
+    deps, _ = departure_windows(
+        calibrated, reference_depth=0.0, required_depth=1.9, duration_seconds=1800
+    )
+    # 水深 0→1.8→2 单调上升，达标从 01:30 到 02:00，恰好 30 分钟可出发
+    assert deps == [(BASE + timedelta(hours=1, minutes=30), BASE + timedelta(hours=1, minutes=30))]
+
+
+def test_calibration_boundary_observation_overrides_zero_residual():
+    # 边界时刻同刻有观测：以观测为准（残差不再强制为零）
+    forecast = pts(1.0, 2.0, 1.0)
+    calibrated = calibrated_forecast_points(forecast, [(BASE, 1.4)])
+    by_time = dict(calibrated)
+    assert by_time[BASE] == 1.4
+    # 另一边界无观测，仍是零残差
+    assert by_time[BASE + timedelta(hours=2)] == 1.0
+
+
+def test_calibration_observations_outside_coverage_ignored():
+    forecast = pts(1.0, 2.0, 1.0)
+    observations = [
+        (BASE - timedelta(hours=1), 9.9),   # 早于首预报点
+        (BASE + timedelta(hours=3), 9.9),   # 晚于末预报点
+    ]
+    assert calibrated_forecast_points(forecast, observations) == forecast
+
+
+def test_calibration_duplicate_observation_last_wins():
+    # 调用方按写入顺序传入时，同刻以最后一个观测为准
+    forecast = pts(0.0, 2.0, 0.0)
+    calibrated = calibrated_forecast_points(
+        forecast,
+        [
+            (BASE + timedelta(hours=1), 1.0),
+            (BASE + timedelta(hours=1), 1.5),
+        ],
+    )
+    assert dict(calibrated)[BASE + timedelta(hours=1)] == 1.5
+
+
+def test_calibration_two_observations_residual_piecewise_linear():
+    # 预报恒为 1.0（平潮）：残差锚点 00:00=0、01:00=+0.4、02:00=0
+    forecast = pts(1.0, 1.0, 1.0)
+    calibrated = calibrated_forecast_points(
+        forecast,
+        [
+            (BASE + timedelta(hours=1), 1.4),
+        ],
+    )
+    by_time = dict(calibrated)
+    assert by_time[BASE] == 1.0
+    assert by_time[BASE + timedelta(hours=1)] == 1.4
+    assert by_time[BASE + timedelta(hours=2)] == 1.0
+    # 复用窗口计算：基准水深 4.0、所需水深 5.0（潮高需 >= 1.0），
+    # 除两端点外全程高于 1.0 → 达标窗口覆盖 (00:00, 02:00]
+    windows = sufficient_depth_windows(calibrated, 4.0, 5.0)
+    assert len(windows) == 1
+    assert windows[0][0] == BASE.timestamp()
+    assert windows[0][1] == (BASE + timedelta(hours=2)).timestamp()

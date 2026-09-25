@@ -27,6 +27,13 @@
   按线性插值、水深复核规则判定每条预约排定通航区间是否**全程达标**（未被预报覆盖
   的区间判为不达标）；仅返回**达标状态变化**的预约（按出发时刻升序），预演**只读**，
   不写入预报、不改动预约。
+- **实测潮位校准窗口**：`PUT /ports/{id}/tide-observations` 批量写入**实测潮高**
+  （同港同一 UTC 时刻重复写入**覆盖旧值**）；`POST /ports/{id}/calibrated-windows`
+  沿用吃水、安全富余、通航时长请求与窗口响应——查询时用**最新预报线性插值**得到
+  观测时刻的预报潮高，**残差 = 实测 − 预报**；仅采用**预报覆盖范围内**的观测，以
+  预报首末时刻的**零残差**为边界锚点（同刻有观测则**观测优先**），锚点间**线性
+  插值残差**并叠加原预报；把预报点与有效观测点时刻合并为折点后**复用现有通航窗口
+  计算**；无有效观测时等同原窗口。校准查询**只读**，不改原预报和预约。
 
 ## 快速开始（单条命令）
 
@@ -64,7 +71,10 @@ docker compose up --build
 | `PATCH` | `/ports/{id}` | 更正港口名称 / 基准水深 |
 | `PUT` | `/ports/{id}/tide-forecasts` | 批量录入/更正潮高预报点（同一时刻重复提交即覆盖） |
 | `GET` | `/ports/{id}/tide-forecasts` | 查看当前预报点 |
+| `PUT` | `/ports/{id}/tide-observations` | 批量写入实测潮高点（同港同一 UTC 时刻重复写入覆盖旧值） |
+| `GET` | `/ports/{id}/tide-observations` | 查看已写入的实测潮高点 |
 | `POST` | `/ports/{id}/windows` | 提交吃水、安全富余、通航时长，计算可出发时段 |
+| `POST` | `/ports/{id}/calibrated-windows` | 实测潮位校准窗口：请求/响应同 `/windows`，按实测残差校准后计算（只读） |
 | `POST` | `/ports/{id}/max-draft` | 提交安全富余、通航时长、允许出发起止，求最大可通航吃水 |
 | `POST` | `/ports/{id}/reservations` | 创建单向航道预约（自动排最早出发时刻） |
 | `GET` | `/ports/{id}/reservations` | 按港口列出**有效**预约（按出发时刻升序） |
@@ -398,6 +408,80 @@ curl -X POST http://localhost:8000/ports/1/forecast-impact-preview \
 `GET /reservations/1/depth-audit` 验证）；若提交的拟录入点不改变任何预约的
 达标状态（例如与当前预报一致），响应为空列表 `[]`。
 
+## 实测潮位校准窗口
+
+潮位站实测数据可对预报做残差校准，用于更贴近实际地评估通航窗口：
+
+- `PUT /ports/{id}/tide-observations`：批量写入实测潮高点
+  （`obs_time` + `tide_height`，时刻按 UTC 规则解释）；**同港同一 UTC 时刻
+  重复写入即覆盖旧值**（与预报点的更正语义一致），可用 `GET
+  /ports/{id}/tide-observations` 查看已写入的实测点；
+- `POST /ports/{id}/calibrated-windows`：**校准窗口查询（只读）**，请求体与
+  窗口响应与 `POST /ports/{id}/windows` **完全一致**
+  （吃水、安全富余、正数通航分钟数；返回 `required_depth`、全部可出发时段
+  `windows` 与 `earliest_departure`）。
+
+校准规则：
+
+1. 查询时读取该港口**最新预报**与全部实测点；对每个观测时刻用相邻预报点
+   **线性插值**得到预报潮高，**残差 = 实测潮高 − 预报潮高**；
+2. **仅采用落在预报覆盖范围 [首预报时刻, 末预报时刻] 内的观测**，范围外的
+   观测忽略（不做外推）；
+3. 以**预报首末时刻的零残差**为边界锚点；边界时刻同刻有观测时**以观测为准**；
+4. 锚点之间对残差做**线性插值**，校准潮高 = 原预报潮高 + 插值残差；
+   观测点处的校准潮高即实测值；
+5. 把**全部预报点时刻与有效观测点时刻合并为折点**（折点之间为线性），再
+   **复用现有通航窗口计算**（同样的达标判定、减通航时长、覆盖不外推规则）；
+6. **无有效观测**（未写入、全部落在覆盖范围外，或预报不足 2 点）时，
+   校准结果与原预报完全一致，响应等同 `/windows`。
+
+校准查询**只读**：不改原预报、不影响已有预约与新预约排程（预约始终按原预报
+计算），实测点仅作用于本接口。
+
+```bash
+# 沿用上文示例港（基准水深 4.5 米，预报潮高 0.5→3.0→0.5，00:00/03:00/06:00）
+# 写入 03:00 的实测潮高 2.0 米（预报 3.0，残差 -1.0 米）
+curl -X PUT http://localhost:8000/ports/1/tide-observations \
+  -H "Content-Type: application/json" \
+  -d '{"points": [{"obs_time": "2026-09-24T03:00:00Z", "tide_height": 2.0}]}'
+# → [{"obs_time": "2026-09-24T03:00:00+00:00", "tide_height": 2.0}]
+
+# 校准窗口查询：校准后水深 5.0→6.5→5.0，所需水深 5.5
+curl -X POST http://localhost:8000/ports/1/calibrated-windows \
+  -H "Content-Type: application/json" \
+  -d '{"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60}'
+```
+
+响应（校准后达标窗口由原 `[00:36, 05:24]` 变为 `[01:00, 05:00]`，
+减去 60 分钟通航时长）：
+
+```json
+{
+  "port_id": 1,
+  "required_depth": 5.5,
+  "duration_minutes": 60.0,
+  "earliest_departure": "2026-09-24T01:00:00+00:00",
+  "windows": [
+    {"start": "2026-09-24T01:00:00+00:00", "end": "2026-09-24T04:00:00+00:00"}
+  ]
+}
+```
+
+```bash
+# 同刻重复写入覆盖旧值；写回与预报一致的 3.0 后，校准窗口等同原窗口
+curl -X PUT http://localhost:8000/ports/1/tide-observations \
+  -H "Content-Type: application/json" \
+  -d '{"points": [{"obs_time": "2026-09-24T03:00:00Z", "tide_height": 3.0}]}'
+```
+
+说明：
+
+- 参数校验与 `/windows` 一致（通航时长为正、吃水/富余非负），
+  实测点列表为空返回 422，港口不存在返回 404；
+- 实测潮高独立于预报存储（`tide_observations` 表），写入实测点不会修改任何
+  预报点；`/windows`、预约排程与水深复核均继续使用原预报；
+- 预报更正后再次查询校准窗口，残差会按**更正后的最新预报**重新计算。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -412,7 +496,7 @@ pytest                                # 运行全部测试（核心算法 + API 
 ```
 app/
   main.py       # FastAPI 路由与生命周期（启动时初始化数据库）
-  tides.py      # 核心算法：线性插值、达标窗口、可出发时段、水深复核、最大可通航吃水、预报合并
+  tides.py      # 核心算法：线性插值、达标窗口、可出发时段、水深复核、最大可通航吃水、预报合并、实测残差校准
   database.py   # SQLite 连接与幂等建表
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

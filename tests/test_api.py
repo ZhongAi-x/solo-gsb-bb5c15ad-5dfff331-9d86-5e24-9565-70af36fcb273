@@ -731,3 +731,220 @@ def test_forecast_impact_preview_validation_and_404(client):
     assert _preview(client, 999, [
         {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}
     ]).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 实测潮位校准窗口
+# PUT/GET /ports/{id}/tide-observations、POST /ports/{id}/calibrated-windows
+# ---------------------------------------------------------------------------
+
+
+def _put_observations(client, port_id, points):
+    return client.put(f"/ports/{port_id}/tide-observations", json={"points": points})
+
+
+def test_upsert_observations_and_list(client):
+    port_id = _setup_port(client)
+    r = _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 2.0},
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 0.6},
+    ])
+    assert r.status_code == 200
+    # 返回按时刻升序的全部实测点
+    assert r.json() == [
+        {"obs_time": "2026-09-24T00:00:00+00:00", "tide_height": 0.6},
+        {"obs_time": "2026-09-24T03:00:00+00:00", "tide_height": 2.0},
+    ]
+    assert client.get(f"/ports/{port_id}/tide-observations").json() == [
+        {"obs_time": "2026-09-24T00:00:00+00:00", "tide_height": 0.6},
+        {"obs_time": "2026-09-24T03:00:00+00:00", "tide_height": 2.0},
+    ]
+
+
+def test_upsert_observations_same_utc_time_overwrites(client):
+    port_id = _setup_port(client)
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 2.0},
+    ])
+    # 同港同一 UTC 时刻重复写入覆盖旧值（不同时区写法表示同一 UTC 时刻）
+    r = _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T05:00:00+02:00", "tide_height": 2.4},
+    ])
+    assert r.status_code == 200
+    assert r.json() == [
+        {"obs_time": "2026-09-24T03:00:00+00:00", "tide_height": 2.4},
+    ]
+
+
+def test_calibrated_windows_uses_observation_residual(client):
+    port_id = _setup_port(client)
+    # 03:00 实测 2.0（预报 3.0，残差 -1.0）：校准潮高 0.5→2.0→0.5，
+    # 水深 5.0→6.5→5.0，所需 5.5 → 达标窗口 [01:00, 05:00]，
+    # 60 分钟通航 → 可出发 [01:00, 04:00]
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 2.0},
+    ])
+    r = client.post(
+        f"/ports/{port_id}/calibrated-windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["required_depth"] == 5.5
+    assert body["duration_minutes"] == 60.0
+    assert body["earliest_departure"] == "2026-09-24T01:00:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T01:00:00+00:00", "end": "2026-09-24T04:00:00+00:00"}
+    ]
+
+    # 覆盖写回与预报一致的值 3.0：校准窗口等同原窗口 [00:36, 04:24]
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 3.0},
+    ])
+    body = client.post(
+        f"/ports/{port_id}/calibrated-windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
+    ).json()
+    assert body["earliest_departure"] == "2026-09-24T00:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
+    ]
+
+
+def test_calibrated_windows_without_observations_equals_original(client):
+    port_id = _setup_port(client)
+    body = {
+        "draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60,
+    }
+    calibrated = client.post(f"/ports/{port_id}/calibrated-windows", json=body).json()
+    original = client.post(f"/ports/{port_id}/windows", json=body).json()
+    assert calibrated == original
+
+
+def test_calibrated_windows_ignores_observations_outside_coverage(client):
+    port_id = _setup_port(client)
+    # 早于首预报点 / 晚于末预报点的观测一律忽略 → 等同原窗口
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-23T23:00:00Z", "tide_height": 9.9},
+        {"obs_time": "2026-09-24T07:00:00Z", "tide_height": 9.9},
+    ])
+    body = {"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60}
+    calibrated = client.post(f"/ports/{port_id}/calibrated-windows", json=body).json()
+    original = client.post(f"/ports/{port_id}/windows", json=body).json()
+    assert calibrated == original
+
+
+def test_calibrated_windows_interior_observation_between_knots(client):
+    # 平潮预报恒 1.0（00:00/04:00），基准水深 4.0：原水深恒 5.0，
+    # 需要 5.25 时无窗口；02:00 实测 1.5（残差 +0.5）后校准潮高
+    # 1.0→1.5→1.0，水深 5.0→5.5→5.0，达标窗口 [01:00, 03:00]
+    r = client.post("/ports", json={"name": "校准港", "reference_depth": 4.0})
+    port_id = r.json()["id"]
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [
+            {"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 1.0},
+            {"forecast_time": "2026-09-24T04:00:00Z", "tide_height": 1.0},
+        ]},
+    )
+    query = {"draft": 4.75, "safety_margin": 0.5, "duration_minutes": 60}
+    assert client.post(f"/ports/{port_id}/windows", json=query).json()["windows"] == []
+
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 1.5},
+    ])
+    body = client.post(f"/ports/{port_id}/calibrated-windows", json=query).json()
+    assert body["earliest_departure"] == "2026-09-24T01:00:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T01:00:00+00:00", "end": "2026-09-24T02:00:00+00:00"}
+    ]
+
+
+def test_calibrated_windows_boundary_observation_overrides_zero_anchor(client):
+    port_id = _setup_port(client)
+    # 首预报时刻 00:00 同刻观测 1.2：边界以观测为准，00:00 处水深 5.7 >= 5.5，
+    # 校准窗口起点直接落在 00:00（原窗口起点为 00:36）
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 1.2},
+    ])
+    body = client.post(
+        f"/ports/{port_id}/calibrated-windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
+    ).json()
+    assert body["windows"][0]["start"] == "2026-09-24T00:00:00+00:00"
+
+
+def test_calibrated_windows_query_is_read_only(client):
+    port_id = _setup_port(client)
+    rid = client.post(
+        f"/ports/{port_id}/reservations", json=RESERVATION_BODY
+    ).json()["id"]
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 2.0},
+    ])
+    client.post(
+        f"/ports/{port_id}/calibrated-windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
+    )
+    # 原预报不变
+    forecasts = client.get(f"/ports/{port_id}/tide-forecasts").json()
+    assert [f["tide_height"] for f in forecasts] == [0.5, 3.0, 0.5]
+    # 预约排程不受影响；原 /windows 仍按未校准预报计算
+    listed = client.get(f"/ports/{port_id}/reservations").json()
+    assert len(listed) == 1
+    assert listed[0]["id"] == rid
+    assert listed[0]["departure_start"] == "2026-09-24T00:36:00+00:00"
+    audit = client.get(f"/reservations/{rid}/depth-audit").json()
+    assert audit["sufficient"] is True
+    original = client.post(
+        f"/ports/{port_id}/windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
+    ).json()
+    assert original["earliest_departure"] == "2026-09-24T00:36:00+00:00"
+
+
+def test_observations_do_not_affect_reservation_scheduling(client):
+    # 实测点只用于校准窗口查询：预约创建仍按原预报排程
+    port_id = _setup_port(client)
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 2.0},
+    ])
+    r = client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY)
+    assert r.status_code == 201
+    assert r.json()["departure_start"] == "2026-09-24T00:36:00+00:00"
+
+
+def test_calibration_validation_and_404(client):
+    port_id = _setup_port(client)
+    # 实测点列表为空 → 422
+    assert _put_observations(client, port_id, []).status_code == 422
+    # 校准窗口同样校验通航时长为正
+    assert client.post(
+        f"/ports/{port_id}/calibrated-windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 0},
+    ).status_code == 422
+    # 未知港口：写入 / 查询实测点 / 校准窗口均 404
+    assert _put_observations(client, 999, [
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 2.0},
+    ]).status_code == 404
+    assert client.get("/ports/999/tide-observations").status_code == 404
+    assert client.post(
+        "/ports/999/calibrated-windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
+    ).status_code == 404
+
+
+def test_observations_naive_datetime_treated_as_utc(client):
+    port_id = _setup_port(client)
+    r = _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T03:00:00", "tide_height": 2.0},  # 无时区 → UTC
+    ])
+    assert r.status_code == 200
+    assert r.json() == [
+        {"obs_time": "2026-09-24T03:00:00+00:00", "tide_height": 2.0},
+    ]
+    body = client.post(
+        f"/ports/{port_id}/calibrated-windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
+    ).json()
+    assert body["earliest_departure"] == "2026-09-24T01:00:00+00:00"

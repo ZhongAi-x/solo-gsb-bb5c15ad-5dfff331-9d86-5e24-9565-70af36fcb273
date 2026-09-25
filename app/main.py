@@ -19,6 +19,12 @@
   有效预约，分别用当前与临时预报按现有线性插值、水深复核规则判定每条
   预约排定通航区间是否全程达标（未被预报覆盖的区间判为不达标），仅返回
   达标状态变化的预约；预演只读，不写入预报、不改动预约。
+- 实测潮位校准窗口：批量写入港口实测潮高（同港同一 UTC 时刻重复写入覆盖
+  旧值）；校准窗口查询沿用吃水、安全富余、通航时长请求与窗口响应——以
+  最新预报线性插值得观测时刻预报潮高，残差 = 实测 − 预报；仅采用预报
+  覆盖范围内的观测，以预报首末时刻的零残差为边界锚点（同刻观测优先），
+  锚点间线性插值残差并叠加原预报，把预报点与有效观测点时刻合并为折点后
+  复用现有通航窗口计算；无有效观测时等同原窗口；查询只读，不改原预报和预约。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -44,10 +50,13 @@ from .schemas import (
     ReservationOut,
     TideForecastOut,
     TideForecastUpsert,
+    TideObservationOut,
+    TideObservationUpsert,
     WindowQuery,
     WindowQueryResult,
 )
 from .tides import (
+    calibrated_forecast_points,
     departure_windows,
     depth_deficit_audit,
     earliest_feasible_departure,
@@ -64,7 +73,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -175,6 +184,60 @@ def _forecast_points(db: Connection, port_id: int) -> list[tuple[datetime, float
     ]
 
 
+def _observation_points(db: Connection, port_id: int) -> list[tuple[datetime, float]]:
+    """读取某港口实测潮高点（(UTC 时刻, 实测潮高)，按时刻升序）。"""
+    rows = db.execute(
+        "SELECT obs_time, tide_height FROM tide_observations "
+        "WHERE port_id = ? ORDER BY obs_time",
+        (port_id,),
+    ).fetchall()
+    return [
+        (datetime.fromisoformat(r["obs_time"]), r["tide_height"])
+        for r in rows
+    ]
+
+
+@app.put("/ports/{port_id}/tide-observations", response_model=list[TideObservationOut])
+def upsert_tide_observations(
+    port_id: int, payload: TideObservationUpsert, db: Connection = Depends(get_db)
+):
+    """批量写入实测潮高点；同港同一 UTC 时刻重复写入即覆盖旧值。
+
+    实测点只在校准窗口查询中使用，不影响原预报与已有预约。
+    """
+    _get_port_or_404(db, port_id)
+    for p in payload.points:
+        t = _normalize(p.obs_time).isoformat()
+        db.execute(
+            """
+            INSERT INTO tide_observations (port_id, obs_time, tide_height)
+            VALUES (?, ?, ?)
+            ON CONFLICT (port_id, obs_time)
+            DO UPDATE SET tide_height = excluded.tide_height
+            """,
+            (port_id, t, p.tide_height),
+        )
+    return _list_observations(db, port_id)
+
+
+@app.get("/ports/{port_id}/tide-observations", response_model=list[TideObservationOut])
+def get_tide_observations(port_id: int, db: Connection = Depends(get_db)):
+    _get_port_or_404(db, port_id)
+    return _list_observations(db, port_id)
+
+
+def _list_observations(db: Connection, port_id: int) -> list[TideObservationOut]:
+    rows = db.execute(
+        "SELECT obs_time, tide_height FROM tide_observations "
+        "WHERE port_id = ? ORDER BY obs_time",
+        (port_id,),
+    ).fetchall()
+    return [
+        TideObservationOut(obs_time=datetime.fromisoformat(r["obs_time"]), tide_height=r["tide_height"])
+        for r in rows
+    ]
+
+
 @app.post("/ports/{port_id}/windows", response_model=WindowQueryResult)
 def query_windows(port_id: int, payload: WindowQuery, db: Connection = Depends(get_db)):
     """船舶提交吃水、安全富余、通航时长，返回全部可出发时段与最早出发时刻。
@@ -183,6 +246,41 @@ def query_windows(port_id: int, payload: WindowQuery, db: Connection = Depends(g
     """
     port = _get_port_or_404(db, port_id)
     points = _forecast_points(db, port_id)
+
+    required_depth = payload.draft + payload.safety_margin
+    windows, earliest = departure_windows(
+        points,
+        reference_depth=port["reference_depth"],
+        required_depth=required_depth,
+        duration_seconds=payload.duration_minutes * 60,
+    )
+    return WindowQueryResult(
+        port_id=port_id,
+        required_depth=required_depth,
+        duration_minutes=payload.duration_minutes,
+        earliest_departure=earliest,
+        windows=[DepartureWindow(start=s, end=e) for s, e in windows],
+    )
+
+
+@app.post("/ports/{port_id}/calibrated-windows", response_model=WindowQueryResult)
+def query_calibrated_windows(
+    port_id: int, payload: WindowQuery, db: Connection = Depends(get_db)
+):
+    """实测潮位校准窗口查询（只读，不改原预报和预约）。
+
+    请求与响应与 POST /ports/{id}/windows 完全一致（吃水、安全富余、
+    正数通航时长；返回全部可出发时段与最早出发时刻）。查询时用最新预报
+    线性插值得到各观测时刻的预报潮高，残差 = 实测 − 预报；仅采用预报
+    覆盖范围内的观测，以预报首末时刻的零残差为边界锚点（同刻观测优先），
+    锚点间线性插值残差并叠加原预报；把预报点与有效观测点时刻合并为折点
+    后复用现有通航窗口计算。无有效观测时结果等同原窗口。
+    """
+    port = _get_port_or_404(db, port_id)
+    points = calibrated_forecast_points(
+        _forecast_points(db, port_id),
+        _observation_points(db, port_id),
+    )
 
     required_depth = payload.draft + payload.safety_margin
     windows, earliest = departure_windows(

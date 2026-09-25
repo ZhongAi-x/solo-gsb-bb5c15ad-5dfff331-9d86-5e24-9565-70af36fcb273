@@ -40,6 +40,17 @@ CREATE TABLE IF NOT EXISTS tide_forecasts (
     PRIMARY KEY (port_id, forecast_time)      -- 同一时刻重复录入即“更正”
 );
 
+CREATE TABLE IF NOT EXISTS tide_observations (
+    port_id  INTEGER NOT NULL
+        REFERENCES ports(id) ON DELETE CASCADE,
+    obs_time TEXT    NOT NULL,                -- 实测时刻（ISO 8601，统一存为 UTC）
+    tide_height REAL NOT NULL,                -- 实测潮高（米，相对海图基准面）
+    PRIMARY KEY (port_id, obs_time)           -- 同港同一 UTC 时刻重复写入即覆盖
+);
+
+CREATE INDEX IF NOT EXISTS idx_tide_observations_port
+    ON tide_observations (port_id, obs_time);
+
 CREATE TABLE IF NOT EXISTS reservations (
     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
     port_id                INTEGER NOT NULL

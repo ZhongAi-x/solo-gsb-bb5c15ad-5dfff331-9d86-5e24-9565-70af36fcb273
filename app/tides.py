@@ -13,9 +13,14 @@
   最大所需水深；吃水 = 最大所需水深 − 安全富余，由调用方按 0.01 米向下取整。
 - 预报影响预演：拟录入的预报点与当前预报按“同一时刻后者覆盖前者”合并成
   临时预报，复用 depth_deficit_audit 分别判定全程达标与否（纯内存计算）。
+- 实测潮位校准：仅采用落在预报覆盖范围内的观测（残差 = 实测 − 观测时刻的
+  线性插值预报），以预报首末时刻的零残差为边界锚点（同刻有观测则以观测为准），
+  锚点间线性插值残差并叠加原预报；把预报点与有效观测点时刻合并为折点后，
+  即可复用现有通航窗口计算（纯内存计算，不改原预报）。
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import datetime, timezone
 
 _EPS = 1e-9  # 浮点容差，保证“恰好达标”的端点被纳入
@@ -236,6 +241,77 @@ def merge_forecast_points(
     for t, h in submitted:
         merged[t] = h
     return sorted(merged.items(), key=lambda kv: kv[0])
+
+
+def _piecewise_linear(points: list[ForecastPoint], t: datetime) -> float:
+    """按相邻点线性插值求时刻 t 的值；t 恰落在折点上时取该折点值。
+
+    调用方需保证 t 位于 points 覆盖范围（首末时刻）之内。
+    """
+    times = [p[0] for p in points]
+    i = bisect_right(times, t) - 1
+    if i < 0:
+        return points[0][1]
+    if i >= len(points) - 1:
+        return points[-1][1]
+    t0, v0 = points[i]
+    t1, v1 = points[i + 1]
+    if t1 == t0:
+        return v1
+    frac = (t - t0).total_seconds() / (t1 - t0).total_seconds()
+    return v0 + (v1 - v0) * frac
+
+
+def calibrated_forecast_points(
+    forecast: list[ForecastPoint],
+    observations: list[ForecastPoint],
+) -> list[ForecastPoint]:
+    """用实测潮位校准预报，返回校准后的潮高折点序列（纯内存，不改入参）。
+
+    - 仅采用落在预报覆盖范围 [首预报时刻, 末预报时刻] 内的观测，范围外忽略；
+    - 观测时刻的预报潮高由最新预报相邻点线性插值得到，残差 = 实测 − 预报；
+    - 以预报首末时刻的零残差为边界锚点；边界时刻同刻有观测时以观测为准
+      （残差为实测 − 该时刻预报）；观测同刻重复时以最后一个为准；
+    - 锚点（边界 + 有效观测）间残差线性插值；校准潮高 = 原预报潮高 + 残差；
+    - 折点时刻 = 全部预报点时刻 ∪ 有效观测点时刻，折点间为线性，
+      可直接复用 sufficient_depth_windows / departure_windows。
+    - 无有效观测（或预报不足 2 点）时，校准结果与原预报完全一致。
+    """
+    if len(forecast) < 2:
+        return list(forecast)
+
+    first_t, last_t = forecast[0][0], forecast[-1][0]
+
+    # 有效观测：落在预报覆盖范围内（含边界），同刻以最后写入为准
+    valid: dict[datetime, float] = {}
+    for t, observed in observations:
+        if first_t <= t <= last_t:
+            valid[t] = observed
+    if not valid:
+        return list(forecast)
+
+    # 残差锚点：预报首末时刻零残差，随后由有效观测覆盖（同刻观测优先）
+    anchors: dict[datetime, float] = {first_t: 0.0, last_t: 0.0}
+    for t, observed in valid.items():
+        predicted = _piecewise_linear(forecast, t)
+        anchors[t] = observed - predicted
+
+    anchor_times = sorted(anchors)
+    anchor_points: list[ForecastPoint] = [
+        (t, anchors[t]) for t in anchor_times
+    ]
+    # 折点时刻 = 预报点时刻 ∪ 有效观测点时刻；观测点处校准值即实测值
+    observed: dict[datetime, float] = dict(valid.items())
+    result: list[ForecastPoint] = []
+    for t, predicted in forecast:
+        if t in observed:
+            result.append((t, observed.pop(t)))
+        else:
+            result.append((t, predicted + _piecewise_linear(anchor_points, t)))
+    for t, observed_height in observed.items():
+        result.append((t, observed_height))
+    result.sort(key=lambda p: p[0])
+    return result
 
 
 def depth_deficit_audit(
