@@ -731,3 +731,152 @@ def test_forecast_impact_preview_validation_and_404(client):
     assert _preview(client, 999, [
         {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}
     ]).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 实测潮位校准窗口
+# ---------------------------------------------------------------------------
+
+WINDOW_QUERY = {"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60}
+
+
+def test_observation_upsert_list_and_overwrite(client):
+    port_id = _setup_port(client)
+    r = client.put(
+        f"/ports/{port_id}/tide-observations",
+        json={"points": [
+            {"observed_time": "2026-09-24T01:30:00Z", "tide_height": 2.0},
+            {"observed_time": "2026-09-24T04:00:00Z", "tide_height": 1.2},
+        ]},
+    )
+    assert r.status_code == 200
+    assert r.json() == [
+        {"observed_time": "2026-09-24T01:30:00+00:00", "tide_height": 2.0},
+        {"observed_time": "2026-09-24T04:00:00+00:00", "tide_height": 1.2},
+    ]
+
+    # 同港同一 UTC 时刻重复写入覆盖旧值
+    r = client.put(
+        f"/ports/{port_id}/tide-observations",
+        json={"points": [{"observed_time": "2026-09-24T01:30:00Z", "tide_height": 2.5}]},
+    )
+    assert r.json() == [
+        {"observed_time": "2026-09-24T01:30:00+00:00", "tide_height": 2.5},
+        {"observed_time": "2026-09-24T04:00:00+00:00", "tide_height": 1.2},
+    ]
+    # GET 与 PUT 返回一致
+    assert client.get(f"/ports/{port_id}/tide-observations").json() == r.json()
+
+
+def test_observation_naive_datetime_treated_as_utc(client):
+    port_id = _setup_port(client)
+    r = client.put(
+        f"/ports/{port_id}/tide-observations",
+        json={"points": [{"observed_time": "2026-09-24T01:30:00", "tide_height": 2.0}]},
+    )
+    assert r.status_code == 200
+    assert r.json() == [
+        {"observed_time": "2026-09-24T01:30:00+00:00", "tide_height": 2.0}
+    ]
+
+
+def test_observation_validation_and_404(client):
+    port_id = _setup_port(client)
+    # 观测点列表为空 → 422
+    assert client.put(
+        f"/ports/{port_id}/tide-observations", json={"points": []}
+    ).status_code == 422
+    # 未知港口 → 404
+    body = {"points": [{"observed_time": "2026-09-24T01:30:00Z", "tide_height": 2.0}]}
+    assert client.put("/ports/999/tide-observations", json=body).status_code == 404
+    assert client.get("/ports/999/tide-observations").status_code == 404
+
+
+def test_calibrated_windows_without_observations_equals_original(client):
+    port_id = _setup_port(client)
+    original = client.post(f"/ports/{port_id}/windows", json=WINDOW_QUERY).json()
+    calibrated = client.post(
+        f"/ports/{port_id}/calibrated-windows", json=WINDOW_QUERY
+    ).json()
+    assert calibrated == original
+    assert calibrated["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
+    ]
+
+
+def test_calibrated_windows_with_observation(client):
+    port_id = _setup_port(client)
+    # 01:30 实测 2.0；预报插值 1.75 → 残差 +0.25
+    # 校准折点潮高：00:00→0.5，01:30→2.0，03:00→3.1667，06:00→0.5
+    client.put(
+        f"/ports/{port_id}/tide-observations",
+        json={"points": [{"observed_time": "2026-09-24T01:30:00Z", "tide_height": 2.0}]},
+    )
+    r = client.post(f"/ports/{port_id}/calibrated-windows", json=WINDOW_QUERY)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["required_depth"] == 5.5
+    assert body["earliest_departure"] == "2026-09-24T00:30:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:30:00+00:00", "end": "2026-09-24T04:26:15+00:00"}
+    ]
+
+
+def test_calibrated_windows_ignores_out_of_coverage_observations(client):
+    port_id = _setup_port(client)
+    # 观测超出预报覆盖范围（00:00–06:00）→ 不采用，等同原窗口
+    client.put(
+        f"/ports/{port_id}/tide-observations",
+        json={"points": [{"observed_time": "2026-09-24T07:00:00Z", "tide_height": 9.9}]},
+    )
+    original = client.post(f"/ports/{port_id}/windows", json=WINDOW_QUERY).json()
+    calibrated = client.post(
+        f"/ports/{port_id}/calibrated-windows", json=WINDOW_QUERY
+    ).json()
+    assert calibrated == original
+
+
+def test_calibrated_windows_boundary_observation_overrides_zero_anchor(client):
+    port_id = _setup_port(client)
+    # 末预报时刻 06:00 同刻观测 1.5：残差 +1.0 取代零残差锚点
+    # 校准折点潮高：00:00→0.5，03:00→3.5，06:00→1.5（全程 >= 1.0 至 06:00）
+    client.put(
+        f"/ports/{port_id}/tide-observations",
+        json={"points": [{"observed_time": "2026-09-24T06:00:00Z", "tide_height": 1.5}]},
+    )
+    body = client.post(f"/ports/{port_id}/calibrated-windows", json=WINDOW_QUERY).json()
+    assert body["earliest_departure"] == "2026-09-24T00:30:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:30:00+00:00", "end": "2026-09-24T05:00:00+00:00"}
+    ]
+
+
+def test_calibrated_windows_read_only(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+    client.put(
+        f"/ports/{port_id}/tide-observations",
+        json={"points": [{"observed_time": "2026-09-24T01:30:00Z", "tide_height": 2.0}]},
+    )
+    client.post(f"/ports/{port_id}/calibrated-windows", json=WINDOW_QUERY)
+
+    # 校准查询只读：原预报与预约均不受影响
+    forecasts = client.get(f"/ports/{port_id}/tide-forecasts").json()
+    assert [f["tide_height"] for f in forecasts] == [0.5, 3.0, 0.5]
+    listed = client.get(f"/ports/{port_id}/reservations").json()
+    assert [r["id"] for r in listed] == [rid]
+    assert listed[0]["departure_start"] == "2026-09-24T00:36:00+00:00"
+    assert listed[0]["departure_end"] == "2026-09-24T01:36:00+00:00"
+
+
+def test_calibrated_windows_validation_and_404(client):
+    port_id = _setup_port(client)
+    # 沿用 /windows 校验：通航时长非正 → 422
+    assert client.post(
+        f"/ports/{port_id}/calibrated-windows",
+        json={**WINDOW_QUERY, "duration_minutes": 0},
+    ).status_code == 422
+    # 未知港口 → 404
+    assert client.post(
+        "/ports/999/calibrated-windows", json=WINDOW_QUERY
+    ).status_code == 404

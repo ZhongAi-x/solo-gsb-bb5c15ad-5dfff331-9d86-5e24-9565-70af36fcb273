@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app.tides import (
+    calibrated_tide_points,
     departure_windows,
     depth_deficit_audit,
     earliest_feasible_departure,
@@ -427,3 +428,80 @@ def test_merge_forecast_points_later_submission_overrides():
     # 纯内存合并：入参不被修改
     assert current == pts(1.0, 2.0, 3.0)
     assert len(submitted) == 4
+
+
+# ---------------------------------------------------------------------------
+# calibrated_tide_points：实测潮位校准
+# ---------------------------------------------------------------------------
+
+
+def test_calibrated_no_observations_returns_original_forecast():
+    forecast = pts(1, 3, 1)
+    result = calibrated_tide_points(forecast, [])
+    assert result == forecast
+    assert result is not forecast  # 返回副本，不改原列表
+
+
+def test_calibrated_requires_two_forecast_points():
+    # 预报不足 2 点无插值区间，观测一律不可用 → 原样返回
+    assert calibrated_tide_points([], [(BASE, 6.0)]) == []
+    assert calibrated_tide_points([(BASE, 5.0)], [(BASE, 6.0)]) == [(BASE, 5.0)]
+
+
+def test_calibrated_ignores_observations_outside_coverage():
+    # 预报覆盖 00:00–02:00，范围外的观测不采用 → 等同原预报
+    forecast = pts(1, 3, 1)
+    obs = [
+        (BASE - timedelta(minutes=1), 9.0),
+        (BASE + timedelta(hours=2, minutes=1), 9.0),
+    ]
+    assert calibrated_tide_points(forecast, obs) == forecast
+
+
+def test_calibrated_curve_passes_through_observation():
+    # 预报 0→2→0（每小时一点）；00:30 实测 2.0，预报插值 1.0，残差 +1.0
+    forecast = pts(0, 2, 0)
+    obs = [(BASE + timedelta(minutes=30), 2.0)]
+    result = calibrated_tide_points(forecast, obs)
+    # 折点 = 预报点与有效观测点时刻的并集
+    assert [t for t, _ in result] == [
+        BASE,
+        BASE + timedelta(minutes=30),
+        BASE + timedelta(hours=1),
+        BASE + timedelta(hours=2),
+    ]
+    heights = [h for _, h in result]
+    assert heights[0] == 0.0   # 边界锚点零残差
+    assert heights[1] == 2.0   # 校准曲线严格经过观测点
+    # 01:00 残差 = 锚点 (00:30, +1) 与 (02:00, 0) 的线性插值 = 2/3
+    assert abs(heights[2] - (2.0 + 2.0 / 3.0)) < 1e-9
+    assert heights[3] == 0.0   # 边界锚点零残差
+
+
+def test_calibrated_boundary_observation_overrides_zero_anchor():
+    # 预报首末时刻存在同刻观测：观测残差取代零残差锚点
+    forecast = pts(1, 3, 1)
+    obs = [(BASE, 2.0), (BASE + timedelta(hours=2), 0.0)]  # 残差 +1 / −1
+    result = calibrated_tide_points(forecast, obs)
+    assert result == [
+        (BASE, 2.0),                        # 1.0 + 1.0
+        (BASE + timedelta(hours=1), 3.0),   # 中点残差线性插值为 0
+        (BASE + timedelta(hours=2), 0.0),   # 1.0 − 1.0
+    ]
+
+
+def test_calibrated_residuals_interpolated_between_anchors():
+    # 潮高恒 0 便于手算：残差锚点 (00:00,0) (01:00,+1) (03:00,−1) (04:00,0)
+    forecast = pts(0, 0, 0, 0, 0)
+    obs = [
+        (BASE + timedelta(hours=1), 1.0),
+        (BASE + timedelta(hours=3), -1.0),
+    ]
+    result = calibrated_tide_points(forecast, obs)
+    assert result == [
+        (BASE, 0.0),
+        (BASE + timedelta(hours=1), 1.0),
+        (BASE + timedelta(hours=2), 0.0),   # +1 与 −1 的中点
+        (BASE + timedelta(hours=3), -1.0),
+        (BASE + timedelta(hours=4), 0.0),
+    ]

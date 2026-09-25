@@ -27,6 +27,13 @@
   按线性插值、水深复核规则判定每条预约排定通航区间是否**全程达标**（未被预报覆盖
   的区间判为不达标）；仅返回**达标状态变化**的预约（按出发时刻升序），预演**只读**，
   不写入预报、不改动预约。
+- **实测潮位校准窗口**：`PUT /ports/{id}/tide-observations` 批量写入观测潮高
+  （同港同一 UTC 时刻重复写入**覆盖旧值**）；`POST /ports/{id}/calibrated-windows`
+  沿用吃水、安全富余、通航时长请求与窗口响应——用**最新预报**插值得到观测时刻的
+  预报潮高（**残差 = 实测 − 预报**），仅采用**预报覆盖范围内**的观测，以预报首末
+  时刻**零残差**为边界锚点（**同刻观测优先**），锚点间线性插值残差并叠加原预报，
+  把预报点与有效观测点时刻合并为折点后复用通航窗口计算；**无有效观测时等同原
+  窗口**；校准查询**只读**，不改原预报和预约。
 
 ## 快速开始（单条命令）
 
@@ -64,7 +71,10 @@ docker compose up --build
 | `PATCH` | `/ports/{id}` | 更正港口名称 / 基准水深 |
 | `PUT` | `/ports/{id}/tide-forecasts` | 批量录入/更正潮高预报点（同一时刻重复提交即覆盖） |
 | `GET` | `/ports/{id}/tide-forecasts` | 查看当前预报点 |
+| `PUT` | `/ports/{id}/tide-observations` | 批量写入/覆盖实测潮位（同一时刻重复写入即覆盖旧值） |
+| `GET` | `/ports/{id}/tide-observations` | 查看当前实测潮位点 |
 | `POST` | `/ports/{id}/windows` | 提交吃水、安全富余、通航时长，计算可出发时段 |
+| `POST` | `/ports/{id}/calibrated-windows` | 实测潮位校准后的可出发时段查询（只读） |
 | `POST` | `/ports/{id}/max-draft` | 提交安全富余、通航时长、允许出发起止，求最大可通航吃水 |
 | `POST` | `/ports/{id}/reservations` | 创建单向航道预约（自动排最早出发时刻） |
 | `GET` | `/ports/{id}/reservations` | 按港口列出**有效**预约（按出发时刻升序） |
@@ -397,6 +407,50 @@ curl -X POST http://localhost:8000/ports/1/forecast-impact-preview \
 预演后库存预报与预约保持不变（可用 `GET /ports/1/tide-forecasts` 与
 `GET /reservations/1/depth-audit` 验证）；若提交的拟录入点不改变任何预约的
 达标状态（例如与当前预报一致），响应为空列表 `[]`。
+
+## 实测潮位校准窗口
+
+`POST /ports/{id}/calibrated-windows`（服务默认监听 **8000** 端口）按实测潮位
+校准后的潮高曲线计算可出发时段，**请求与响应和 `/windows` 完全相同**
+（吃水、安全富余、正数通航分钟数 → 全部可出发时段与最早出发时刻）：
+
+- 观测潮高通过 `PUT /ports/{id}/tide-observations` 批量写入，同港同一 UTC
+  时刻重复写入**覆盖旧值**；`GET /ports/{id}/tide-observations` 查看当前观测；
+- 校准规则：用**最新预报**线性插值得到每个观测时刻的预报潮高，
+  **残差 = 实测 − 预报**；仅采用**预报覆盖范围内**（首末预报点之间，含端点）
+  的观测；以预报首末时刻**零残差**为边界锚点（该时刻有观测时**同刻观测
+  优先**，以观测残差取代零值），锚点间线性插值残差并叠加原预报；
+- 校准曲线为分段线性：把**预报点与有效观测点时刻合并为折点**后，复用与
+  `/windows` 相同的通航窗口计算；**无有效观测时结果等同原窗口**；
+- 校准查询**只读**：不改动原预报与预约；观测点只影响校准查询，
+  `/windows`、`/max-draft`、预约等其余接口行为不变。
+
+```bash
+# 1. 写入实测潮位（01:30 实测 2.0 米；同刻重复写入会覆盖旧值）
+curl -X PUT http://localhost:8000/ports/1/tide-observations \
+  -H "Content-Type: application/json" \
+  -d '{"points": [{"observed_time": "2026-09-24T01:30:00Z", "tide_height": 2.0}]}'
+
+# 2. 校准窗口查询（请求体与 /windows 相同）
+curl -X POST http://localhost:8000/ports/1/calibrated-windows \
+  -H "Content-Type: application/json" \
+  -d '{"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60}'
+```
+
+响应（01:30 预报插值 1.75，残差 +0.25；折点 00:00/01:30/03:00/06:00 的校准
+潮高为 0.5/2.0/3.1667/0.5，达标窗口 [00:30, 05:26:15]，减去 60 分钟通航时长）：
+
+```json
+{
+  "port_id": 1,
+  "required_depth": 5.5,
+  "duration_minutes": 60.0,
+  "earliest_departure": "2026-09-24T00:30:00+00:00",
+  "windows": [
+    {"start": "2026-09-24T00:30:00+00:00", "end": "2026-09-24T04:26:15+00:00"}
+  ]
+}
+```
 
 ## 本地开发（不用 Docker）
 

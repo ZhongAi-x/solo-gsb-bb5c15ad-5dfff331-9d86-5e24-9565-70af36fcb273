@@ -13,9 +13,14 @@
   最大所需水深；吃水 = 最大所需水深 − 安全富余，由调用方按 0.01 米向下取整。
 - 预报影响预演：拟录入的预报点与当前预报按“同一时刻后者覆盖前者”合并成
   临时预报，复用 depth_deficit_audit 分别判定全程达标与否（纯内存计算）。
+- 实测潮位校准：仅采用预报覆盖时段内的观测，残差 = 实测潮高 − 观测时刻的
+  预报插值；以预报首末时刻零残差为边界锚点（同刻观测优先），锚点间线性
+  插值残差并叠加原预报；校准曲线分段线性，折点为预报点与有效观测点时刻
+  的并集；无有效观测时等同原预报。
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import datetime, timezone
 
 _EPS = 1e-9  # 浮点容差，保证“恰好达标”的端点被纳入
@@ -236,6 +241,67 @@ def merge_forecast_points(
     for t, h in submitted:
         merged[t] = h
     return sorted(merged.items(), key=lambda kv: kv[0])
+
+
+def _interp_linear(ts: list[float], ys: list[float], x: float) -> float:
+    """升序折线 (ts, ys) 上 x 处的线性插值；x 须落在 [ts[0], ts[-1]] 内。"""
+    i = bisect_right(ts, x) - 1
+    if i == len(ts) - 1 or ts[i] == x:
+        return ys[i]
+    t0, t1 = ts[i], ts[i + 1]
+    y0, y1 = ys[i], ys[i + 1]
+    return y0 + (y1 - y0) * (x - t0) / (t1 - t0)
+
+
+def calibrated_tide_points(
+    forecast: list[ForecastPoint],
+    observations: list[ForecastPoint],
+) -> list[ForecastPoint]:
+    """用实测潮位校准预报，返回合并折点后的校准潮高点序列（纯内存计算）。
+
+    - 仅采用落在预报覆盖时段 [首个预报点, 末个预报点] 内的观测（含端点）；
+    - 残差 = 实测潮高 − 观测时刻的预报线性插值潮高；
+    - 残差锚点：预报首末时刻残差为 0（该时刻存在观测时以观测残差为准），
+      加上各有效观测点的残差，锚点之间线性插值；
+    - 校准潮高(t) = 预报插值(t) + 残差插值(t)：两条分段线性曲线之和仍分段
+      线性，折点取预报点与有效观测点时刻的并集，按时刻升序返回；
+      校准曲线严格经过每个有效观测点；
+    - 无有效观测（或预报不足 2 点无法插值）时原样返回预报点。
+    """
+    if len(forecast) < 2 or not observations:
+        return list(forecast)
+
+    f_ts = [p[0].timestamp() for p in forecast]
+    f_h = [p[1] for p in forecast]
+    first_ts, last_ts = f_ts[0], f_ts[-1]
+
+    # 有效观测：落在预报覆盖时段内（含首末端点）；同时刻后者覆盖前者
+    valid: dict[float, tuple[datetime, float]] = {}
+    for t, h in observations:
+        ts = t.timestamp()
+        if first_ts <= ts <= last_ts:
+            valid[ts] = (t, h)
+    if not valid:
+        return list(forecast)
+
+    # 残差锚点：预报首末时刻零残差为边界，同刻观测以其残差覆盖零值
+    anchors: dict[float, float] = {first_ts: 0.0, last_ts: 0.0}
+    for ts, (_, h) in valid.items():
+        anchors[ts] = h - _interp_linear(f_ts, f_h, ts)
+    a_ts = sorted(anchors)
+    a_r = [anchors[t] for t in a_ts]
+
+    # 折点：预报点与有效观测点时刻的并集，逐折点求校准潮高
+    times: dict[float, datetime] = {p[0].timestamp(): p[0] for p in forecast}
+    for ts, (t, _) in valid.items():
+        times[ts] = t
+    return [
+        (
+            times[ts],
+            _interp_linear(f_ts, f_h, ts) + _interp_linear(a_ts, a_r, ts),
+        )
+        for ts in sorted(times)
+    ]
 
 
 def depth_deficit_audit(
